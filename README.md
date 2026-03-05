@@ -1,4 +1,4 @@
-# club-email-digest
+# club-digest
 
 An autonomous AI agent that checks a Gmail inbox on a schedule, summarizes every unread email using Claude Haiku, and delivers a prioritized digest to a Discord channel, all running free on GitHub Actions.
 
