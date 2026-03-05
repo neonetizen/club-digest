@@ -35,8 +35,7 @@ Every morning, the agent:
 
 You need an app password — not your real Gmail password. This lets the script authenticate without OAuth and can be revoked independently.
 
-1. Enable 2-Step Verification on the Gmail account: [myaccount.google.com/security](https://myaccount.google.com/security)
-2. Go to **App passwords** (bottom of the 2-Step Verification page)
+1. Enable 2-Step Verification on the Gmail account: [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords)
 3. Name it anything (e.g. "digest bot") and generate
 4. Copy the 16-character password — you only see it once
 
