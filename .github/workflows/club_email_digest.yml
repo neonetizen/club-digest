@@ -24,8 +24,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .email_agent_state.json
-          key: email-state-${{ runner.os }}
-          restore-keys: email-state-
+          key: email-state-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: email-state-${{ runner.os }}
 
       - name: Run agent
         env:
@@ -39,5 +39,5 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: .email_agent_state.json
-          key: email-state-${{ runner.os }}
+          key: email-state-${{ runner.os }}-${{ github.run_id }}
 # ══════════════════════════════════════════════════════════════════════════════
