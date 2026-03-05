@@ -1,0 +1,54 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# GITHUB ACTIONS
+# ══════════════════════════════════════════════════════════════════════════════
+name: Club Email Digest
+
+on:
+  schedule:
+    - cron: '0 16 * * *'   # Every day at 8am PST (16:00 UTC)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Restore state cache
+        uses: actions/cache@v4
+        with:
+          path: .email_agent_state.json
+          key: email-state-${{ runner.os }}
+          restore-keys: email-state-
+
+      - name: Run agent
+        env:
+          ANTHROPIC_API_KEY:       ${{ secrets.ANTHROPIC_API_KEY }}
+          CLUB_GMAIL_ADDRESS:      ${{ secrets.CLUB_GMAIL_ADDRESS }}
+          CLUB_GMAIL_APP_PASSWORD: ${{ secrets.CLUB_GMAIL_APP_PASSWORD }}
+          DISCORD_WEBHOOK_URL:     ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: uv run club_email_digest.py
+
+      - name: Save state cache
+        uses: actions/cache/save@v4
+        with:
+          path: .email_agent_state.json
+          key: email-state-${{ runner.os }}
+
+      - name: Save state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .email_agent_state.json
+          git diff --staged --quiet || git commit -m "state: $(date -u '+%Y-%m-%d')"
+          git push
+# ══════════════════════════════════════════════════════════════════════════════
