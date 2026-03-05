@@ -27,7 +27,7 @@ import os
 import json
 import re
 from email.header import decode_header
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 import requests
@@ -44,6 +44,8 @@ IMAP_SERVER      = "imap.gmail.com"
 IMAP_PORT        = 993
 
 MAX_EMAILS_PER_RUN = 15
+
+EMAIL_CUTOFF = datetime.now(timezone.utc) - timedelta(days=180)
 
 STATE_FILE = os.path.join(os.path.dirname(__file__), ".email_agent_state.json")
 
@@ -140,6 +142,16 @@ def fetch_unread_emails(seen_uids: list) -> list[dict]:
             _, msg_data = imap.fetch(uid, "(RFC822)")
             raw = msg_data[0][1]
             msg = email.message_from_bytes(raw)
+
+            try:
+                from email.utils import parsedate_to_datetime
+                msg_date = parsedate_to_datetime(msg.get("Date", ""))
+                if msg_date.tzinfo is None:
+                    msg_date = msg_date.replace(tzinfo=timezone.utc)
+                if msg_date < EMAIL_CUTOFF:
+                    continue
+            except Exception:
+                pass
 
             emails.append({
                 "uid":     uid_str,
