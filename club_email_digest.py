@@ -6,7 +6,7 @@ Fetches unread emails from a Gmail inbox, summarizes each one using Claude
 Haiku, and sends a digest to a Discord channel via webhook.
 
 Setup:
-    pip install anthropic
+    uv sync
 
 Environment variables:
     ANTHROPIC_API_KEY       - Anthropic API key
