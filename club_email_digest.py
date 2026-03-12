@@ -5,6 +5,16 @@ Club Email Digest Agent
 Fetches unread emails from a Gmail inbox, summarizes each one using Claude
 Haiku, and sends a digest to a Discord channel via webhook.
 
+The script is structured as three swappable layers:
+
+    SOURCE  →  fetch_unread_emails()   read from anywhere (IMAP, RSS, Slack, API...)
+    AI      →  summarize_emails()      triage / summarize / extract with Claude
+    DELIVER →  send_to_discord()       post anywhere (Discord, Slack, email, SMS...)
+
+To fork this for a different use case, you mostly just replace the SOURCE
+function and tweak the system prompt. The state/dedup logic and delivery layer
+transfer almost unchanged.
+
 Setup:
     uv sync
 
@@ -33,7 +43,11 @@ from typing import Optional
 import requests
 import anthropic
 
+
 # ── Config ────────────────────────────────────────────────────────────────────
+# If you're adapting this for a different source, replace the first two vars
+# with whatever credentials that source needs (API key, OAuth token, etc.).
+# DISCORD_WEBHOOK and ANTHROPIC_KEY stay the same regardless of source.
 
 GMAIL_ADDRESS    = os.environ.get("CLUB_GMAIL_ADDRESS")
 GMAIL_PASSWORD   = os.environ.get("CLUB_GMAIL_APP_PASSWORD")
@@ -43,14 +57,30 @@ ANTHROPIC_KEY    = os.environ.get("ANTHROPIC_API_KEY")
 IMAP_SERVER      = "imap.gmail.com"
 IMAP_PORT        = 993
 
+# Caps how much Claude processes per run — keeps token costs predictable and
+# prevents a flooded inbox from burning through your budget on day one.
 MAX_EMAILS_PER_RUN = 15
 
+# Only look at emails from the last 6 months. Useful on first run when there's
+# years of backlog you don't care about. Adjust or remove as needed.
 EMAIL_CUTOFF = datetime.now(timezone.utc) - timedelta(days=180)
 
+# Persisted between runs via GitHub Actions Cache (see the workflow YAML).
+# If you run this locally on a server, it just lives on disk — same idea.
 STATE_FILE = os.path.join(os.path.dirname(__file__), ".email_agent_state.json")
 
 
 # ── State ─────────────────────────────────────────────────────────────────────
+# "Have I seen this before?" — the core of any periodic agent.
+#
+# The state file stores IDs of already-processed items so re-running never
+# double-reports. For email it's IMAP UIDs; for RSS you'd store GUIDs; for
+# GitHub notifications you'd store event IDs; for Reddit, post IDs. Same shape
+# either way: a list of strings inside a JSON object.
+#
+# The "first_run" flag is a one-time safety valve: on initial execution the
+# inbox might have hundreds of old unread emails. Without it you'd flood
+# Discord and burn API credits on noise. After the first run it's ignored.
 
 def load_state() -> dict:
     if os.path.exists(STATE_FILE):
@@ -64,10 +94,19 @@ def save_state(state: dict):
         json.dump(state, f, indent=2)
 
 
-# ── Gmail IMAP ────────────────────────────────────────────────────────────────
+# ── Source: Gmail IMAP ────────────────────────────────────────────────────────
+# This is the layer to replace when adapting for a different data source.
+#
+# Whatever you swap in, the function should return a list of dicts with at
+# least a unique "uid" key (used for dedup) and whatever fields the AI prompt
+# will reference. For an RSS feed that might be {"uid", "title", "link",
+# "summary"}; for Slack it might be {"uid", "channel", "author", "text"}.
+#
+# The two helper functions below (decode_str, get_body) are IMAP-specific —
+# replace them with whatever parsing your source needs.
 
 def decode_str(value: str) -> str:
-    """Decode encoded email header strings."""
+    """Decode encoded email header strings (e.g. base64 subject lines)."""
     if not value:
         return ""
     parts = decode_header(value)
@@ -81,7 +120,11 @@ def decode_str(value: str) -> str:
 
 
 def get_body(msg) -> str:
-    """Extract plain text body from email, falling back to HTML stripped of tags."""
+    """Extract plain text body, falling back to HTML stripped of tags.
+
+    Capped at 1500 chars — enough context for Claude to summarize, not so
+    much that a newsletter doubles your token bill.
+    """
     body = ""
     if msg.is_multipart():
         for part in msg.walk():
@@ -116,7 +159,12 @@ def get_body(msg) -> str:
 
 
 def fetch_unread_emails(seen_uids: list) -> list[dict]:
-    """Connect to Gmail via IMAP and fetch unread emails not yet processed."""
+    """Connect to Gmail via IMAP and return emails not yet processed.
+
+    To swap in a different source, replace this function entirely.
+    Keep the same signature: takes seen_uids (list of string IDs already
+    processed), returns a list of dicts each with at least a "uid" field.
+    """
     print(f"📬 Connecting to Gmail as {GMAIL_ADDRESS}...")
     seen_set = set(seen_uids)
     emails = []
@@ -125,6 +173,8 @@ def fetch_unread_emails(seen_uids: list) -> list[dict]:
         imap.login(GMAIL_ADDRESS, GMAIL_PASSWORD)
         imap.select("INBOX")
 
+        # "UNSEEN" is Gmail's unread filter. Other useful IMAP search terms:
+        # "ALL", "FROM someaddress@example.com", "SINCE 01-Jan-2025", etc.
         _, data = imap.search(None, "UNSEEN")
         uids = data[0].split()
 
@@ -143,6 +193,8 @@ def fetch_unread_emails(seen_uids: list) -> list[dict]:
             raw = msg_data[0][1]
             msg = email.message_from_bytes(raw)
 
+            # Skip emails older than EMAIL_CUTOFF. Remove this block if you
+            # want to process everything regardless of age.
             try:
                 from email.utils import parsedate_to_datetime
                 msg_date = parsedate_to_datetime(msg.get("Date", ""))
@@ -165,15 +217,34 @@ def fetch_unread_emails(seen_uids: list) -> list[dict]:
     return emails
 
 
-# ── Claude Summarization ──────────────────────────────────────────────────────
+# ── AI: Claude Summarization ──────────────────────────────────────────────────
+# This is where the agent's "personality" lives. The system_prompt is the main
+# thing to change when adapting for a new use case.
+#
+# Some other things you could do here instead of triage/summarization:
+#   - Extract action items or deadlines from a project management channel
+#   - Categorize support tickets by topic and estimate resolution effort
+#   - Summarize a day's worth of Hacker News comments on a specific thread
+#   - Pull out names/orgs/amounts from a batch of invoices or receipts
+#
+# Model note: claude-haiku-4-5-20251001 is fast and cheap — good for high-
+# volume triage. Swap for claude-sonnet-4-6 if you need more nuanced reasoning
+# (e.g., understanding technical content or multi-step instructions).
 
 def summarize_emails(emails: list[dict]) -> str:
-    """Summarize all fetched emails using Claude Haiku."""
+    """Run the email batch through Claude and return a formatted digest."""
     if not ANTHROPIC_KEY:
+        # Graceful fallback — useful for testing the fetch/parse layer without
+        # burning API credits.
         return json.dumps(emails, indent=2)
 
     client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 
+    # The system prompt is the most important thing to customize. This one is
+    # tuned for a club president who wants fast triage. The three-bucket
+    # structure (action / FYI / ignore) maps well to Discord's eye-scan UX.
+    # If your use case is different — say, a daily news briefing or a bug
+    # report summary — rewrite this section entirely.
     system_prompt = """You are a helpful assistant summarizing emails for a college
 AI club president. He hasn't checked this inbox in a while and wants to quickly
 understand what's there without reading everything himself.
@@ -202,10 +273,23 @@ Summarize them:
     return message.content[0].text
 
 
-# ── Discord ───────────────────────────────────────────────────────────────────
+# ── Delivery: Discord ─────────────────────────────────────────────────────────
+# This is the other layer to swap out. Discord webhooks are the simplest
+# delivery mechanism — just a POST with {"content": "..."}.
+#
+# To send to Slack instead: same structure, but the payload key is "text"
+#   requests.post(SLACK_WEBHOOK, json={"text": chunk})
+#
+# To send via email instead: swap requests.post for smtplib or sendgrid/mailgun.
+#
+# To write to a file or Notion page instead: skip HTTP entirely and write to
+# disk or hit the Notion API.
+#
+# The 1900-char chunking is Discord-specific (Discord's limit is 2000 chars).
+# Remove or adjust for other delivery targets.
 
 def send_to_discord(content: str, email_count: int):
-    """Send digest to Discord, splitting into chunks if needed."""
+    """Post the digest to Discord, splitting into chunks to stay under the char limit."""
     if not DISCORD_WEBHOOK:
         print("⚠️  DISCORD_WEBHOOK_URL not set — printing to stdout only.")
         print(content)
@@ -226,10 +310,15 @@ def send_to_discord(content: str, email_count: int):
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
+# The pipeline is intentionally flat here so you can see the whole flow in one
+# glance: validate → load state → fetch → summarize → deliver → save state.
+# Each step is a function call you can swap independently.
 
 def main():
     print(f"📧 Club Email Digest Agent — {datetime.now().strftime('%Y-%m-%d %H:%M')} UTC\n")
 
+    # All four vars are required. If you swap the source or delivery layer,
+    # update this check to match your new required variables.
     missing = [k for k, v in {
         "CLUB_GMAIL_ADDRESS":      GMAIL_ADDRESS,
         "CLUB_GMAIL_APP_PASSWORD": GMAIL_PASSWORD,
@@ -260,9 +349,11 @@ def main():
 
     send_to_discord(summary, len(emails))
 
-    # Update state
+    # Mark these items as seen so they're skipped on the next run.
+    # The [-1000:] cap keeps the state file from growing forever — 1000 IDs
+    # is plenty of lookback for a low-volume inbox.
     state["seen_uids"].extend([e["uid"] for e in emails])
-    state["seen_uids"] = state["seen_uids"][-1000:]  # keep last 1000
+    state["seen_uids"] = state["seen_uids"][-1000:]
     state["first_run"] = False
     save_state(state)
 

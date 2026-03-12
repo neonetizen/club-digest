@@ -4,8 +4,13 @@
 name: Club Email Digest
 
 on:
+  # Runs at 4pm UTC = 8am PST. Adjust to match your timezone / audience.
+  # cron syntax: minute hour day-of-month month day-of-week
+  # Generator: https://crontab.guru
   schedule:
     - cron: '0 16 * * *'
+  # Also triggerable manually from the Actions tab — handy for testing
+  # without waiting for the schedule.
   workflow_dispatch:
 
 jobs:
@@ -20,6 +25,11 @@ jobs:
       - name: Install dependencies
         run: uv sync
 
+      # The state file tracks which emails have already been processed.
+      # We can't commit it to the repo (it changes every run), so we store
+      # it in GitHub's cache instead. The restore-keys prefix lets us grab
+      # the most recent cache even if the exact key doesn't match — which
+      # is what we want since the key includes the run_id.
       - name: Restore state cache
         uses: actions/cache@v4
         with:
@@ -27,6 +37,10 @@ jobs:
           key: email-state-${{ runner.os }}-${{ github.run_id }}
           restore-keys: email-state-${{ runner.os }}
 
+      # All secrets are set in: repo Settings → Secrets and variables → Actions.
+      # If you fork this for a different source, replace the source-specific
+      # secrets (CLUB_GMAIL_*) — ANTHROPIC_API_KEY and DISCORD_WEBHOOK_URL
+      # stay the same.
       - name: Run agent
         env:
           ANTHROPIC_API_KEY:       ${{ secrets.ANTHROPIC_API_KEY }}
@@ -35,6 +49,8 @@ jobs:
           DISCORD_WEBHOOK_URL:     ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: uv run club_email_digest.py
 
+      # Always save state, even if the run found nothing new — the file may
+      # have been updated with the first_run=false flag.
       - name: Save state cache
         uses: actions/cache/save@v4
         with:
